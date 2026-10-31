@@ -245,4 +245,67 @@ struct UtilityTests {
         #expect(attachments[0].options.aliases == ["api.test", ".foo.test"])
         #expect(attachments[1].options.aliases == ["db.test"])
     }
+
+    private func makeVolume() -> VolumeConfiguration {
+        VolumeConfiguration(name: "vol", driver: "local", source: "/tmp/vol")
+    }
+
+    @Test("Volume create retries after the volume disappears before inspect")
+    func testCreateOrInspectVolumeRetriesWhenInspectNotFound() async throws {
+        let volume = makeVolume()
+        var creates = 0
+        let result = try await Utility.createOrInspectVolume(
+            create: {
+                creates += 1
+                if creates == 1 { throw VolumeError.volumeAlreadyExists("vol") }
+                return volume
+            },
+            inspect: { throw VolumeError.volumeNotFound("vol") }
+        )
+
+        #expect(creates == 2)
+        #expect(result.wasCreated)
+    }
+
+    @Test("Volume inspect result is used when the volume already exists")
+    func testCreateOrInspectVolumeInspectsExisting() async throws {
+        let volume = makeVolume()
+        let result = try await Utility.createOrInspectVolume(
+            create: { throw ContainerizationError(.exists, message: "volume 'vol' already exists") },
+            inspect: { volume }
+        )
+
+        #expect(!result.wasCreated)
+        #expect(result.volume.name == "vol")
+    }
+
+    @Test("Volume create gives up after the retry is spent")
+    func testCreateOrInspectVolumeStopsAfterOneRetry() async {
+        var creates = 0
+        await #expect(throws: VolumeError.self) {
+            _ = try await Utility.createOrInspectVolume(
+                create: {
+                    creates += 1
+                    throw VolumeError.volumeAlreadyExists("vol")
+                },
+                inspect: { throw VolumeError.volumeNotFound("vol") }
+            )
+        }
+        #expect(creates == 2)
+    }
+
+    @Test("Volume create does not retry on other errors")
+    func testCreateOrInspectVolumeRethrowsOtherErrors() async {
+        var creates = 0
+        await #expect(throws: VolumeError.self) {
+            _ = try await Utility.createOrInspectVolume(
+                create: {
+                    creates += 1
+                    throw VolumeError.storageError("disk")
+                },
+                inspect: { throw VolumeError.volumeNotFound("vol") }
+            )
+        }
+        #expect(creates == 1)
+    }
 }

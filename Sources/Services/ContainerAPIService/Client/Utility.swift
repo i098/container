@@ -410,34 +410,65 @@ public struct Utility {
     private static func getOrCreateVolume(parsed: ParsedVolume, log: Logger) async throws -> VolumeConfiguration {
         let labels = parsed.isAnonymous ? [VolumeConfiguration.anonymousLabel: ""] : [:]
 
-        let volume: VolumeConfiguration
-        var wasCreated = false
-        do {
-            volume = try await ClientVolume.create(
-                name: parsed.name,
-                driver: "local",
-                driverOpts: [:],
-                labels: labels
-            )
-            wasCreated = true
-        } catch let error as VolumeError {
-            guard case .volumeAlreadyExists = error else {
-                throw error
-            }
-            // Volume already exists, just inspect it
-            volume = try await ClientVolume.inspect(parsed.name)
-        } catch let error as ContainerizationError {
-            // Handle XPC-wrapped volumeAlreadyExists error
-            guard error.message.contains("already exists") else {
-                throw error
-            }
-            volume = try await ClientVolume.inspect(parsed.name)
-        }
+        let (volume, wasCreated) = try await createOrInspectVolume(
+            create: {
+                try await ClientVolume.create(
+                    name: parsed.name,
+                    driver: "local",
+                    driverOpts: [:],
+                    labels: labels
+                )
+            },
+            inspect: { try await ClientVolume.inspect(parsed.name) }
+        )
 
         if wasCreated && !parsed.isAnonymous {
             log.warning("named volume was automatically created", metadata: ["volume": "\(parsed.name)"])
         }
 
         return volume
+    }
+
+    /// Creates a volume, or inspects it if another caller created it first.
+    /// If the volume is removed between the failed create and the inspect, creates it again.
+    static func createOrInspectVolume(
+        create: () async throws -> VolumeConfiguration,
+        inspect: () async throws -> VolumeConfiguration
+    ) async throws -> (volume: VolumeConfiguration, wasCreated: Bool) {
+        // The server serializes create, so a second pass only repeats if another caller removed the volume in between.
+        let maxAttempts = 2
+        for attempt in 1...maxAttempts {
+            do {
+                return (try await create(), true)
+            } catch let error where isVolumeError(error, .alreadyExists) {
+                do {
+                    return (try await inspect(), false)
+                } catch let error where isVolumeError(error, .notFound) && attempt < maxAttempts {
+                    continue
+                }
+            }
+        }
+        preconditionFailure("unreachable: the last attempt returns or throws")
+    }
+
+    private enum VolumeErrorKind {
+        case alreadyExists
+        case notFound
+    }
+
+    private static func isVolumeError(_ error: Error, _ kind: VolumeErrorKind) -> Bool {
+        if let error = error as? VolumeError {
+            switch (error, kind) {
+            case (.volumeAlreadyExists, .alreadyExists), (.volumeNotFound, .notFound):
+                return true
+            default:
+                return false
+            }
+        }
+        // Errors from the API server arrive wrapped in ContainerizationError.
+        if let error = error as? ContainerizationError {
+            return error.message.contains(kind == .alreadyExists ? "already exists" : "not found")
+        }
+        return false
     }
 }
