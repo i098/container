@@ -32,29 +32,47 @@ extension Application {
         @OptionGroup
         public var logOptions: Flags.Logging
 
+        /// Deletes `ids` one by one and totals the space freed. A container whose deletion fails is
+        /// reported through `onFailure`, and its size is not counted because it is still on disk.
+        static func prune(
+            ids: [String],
+            diskUsage: (String) async throws -> UInt64,
+            delete: (String) async throws -> Void,
+            onFailure: (String, Error) -> Void
+        ) async -> (pruned: [String], reclaimed: UInt64) {
+            var pruned = [String]()
+            var reclaimed: UInt64 = 0
+
+            for id in ids {
+                do {
+                    let actualSize = try await diskUsage(id)
+                    try await delete(id)
+                    reclaimed += actualSize
+                    pruned.append(id)
+                } catch {
+                    onFailure(id, error)
+                }
+            }
+            return (pruned, reclaimed)
+        }
+
         public func run() async throws {
             let client = ContainerClient()
             let filters = ContainerListFilters(status: .stopped).withoutPlugins([ResourcePluginValues.machine, ResourcePluginValues.cluster])
             let containersToPrune = try await client.list(filters: filters)
 
-            var prunedContainerIds = [String]()
-            var totalSize: UInt64 = 0
-
-            for container in containersToPrune {
-                do {
-                    let actualSize = try await client.diskUsage(id: container.id)
-                    totalSize += actualSize
-                    try await client.delete(id: container.id)
-                    prunedContainerIds.append(container.id)
-                } catch {
+            let (prunedContainerIds, totalSize) = await Self.prune(
+                ids: containersToPrune.map(\.id),
+                diskUsage: { try await client.diskUsage(id: $0) },
+                delete: { try await client.delete(id: $0) },
+                onFailure: { id, error in
                     log.error(
                         "failed to prune container",
                         metadata: [
-                            "id": "\(container.id)",
+                            "id": "\(id)",
                             "error": "\(error)",
                         ])
-                }
-            }
+                })
 
             let formatter = ByteCountFormatter()
             let freed = formatter.string(fromByteCount: Int64(totalSize))
